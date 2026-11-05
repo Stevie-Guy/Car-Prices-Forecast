@@ -1,17 +1,17 @@
 """Scraper pentru pagini de listare Auto.ro (ex. https://www.auto.ro/masini-second-hand/).
 
-Pastreaza aceeasi schema SQLite (listings + snapshots) ca autovit_scraper.py
-pentru a salva ambele surse in acelasi fisier cars.db.
+Pastreaza aceeasi schema SQLite (listings + snapshots) ca scraper_autovit.py,
+astfel incat bazele de date ale celor doua surse pot fi unite cu database_merger.py.
 
 Exemple:
     # Colecteaza 250 de masini (cate 100 pe pagina -> doar 3 cereri HTTP)
-    python scraper_02.py --url https://www.auto.ro/masini-second-hand --per-page 100 --max-cars 250
+    python src/scraper_autoro.py --url https://www.auto.ro/masini-second-hand --per-page 100 --max-cars 250
 
     # Colecteaza 10 pagini a cate 100 de masini (1000 de anunturi) si salveaza si in JSONL
-    python scraper_02.py --url https://www.auto.ro/masini-second-hand --per-page 100 --max-pages 10 --jsonl autoro.jsonl
+    python src/scraper_autoro.py --url https://www.auto.ro/masini-second-hand --per-page 100 --max-pages 10 --jsonl autoro.jsonl
 
     # Offline, pe un fisier salvat din browser
-    python scraper_02.py --html-file autoro_p1.html
+    python src/scraper_autoro.py --html-file autoro_p1.html
 
 Instalare: pip install requests beautifulsoup4
 """
@@ -31,6 +31,9 @@ import requests
 from bs4 import BeautifulSoup
 
 SOURCE = "autoro"
+# Baza implicita din repo, indiferent din ce folder e rulat scriptul
+REPO_ROOT = Path(__file__).resolve().parent.parent
+DEFAULT_DB = REPO_ROOT / "data" / "autoro" / "cars_autoro.db"
 BLOCK_HINTS = ("captcha", "access denied", "request blocked", "are you a robot", "cloudflare")
 
 HEADERS = {
@@ -252,13 +255,13 @@ def store(db, rows, page, search_url):
 # ------------------------------------------------------------------ retea
 def page_url(base, page):
     """Construieste URL-ul de paginare pentru auto.ro:
-    Pagina 1: https://www.auto.ro/masini-second-hand/
     Pagina N: https://www.auto.ro/masini-second-hand/pagina-N.html
+
+    Folosim pagina-1.html si pentru prima pagina: URL-ul fara numar ignora perPage
+    si intoarce mereu doar 20 de anunturi.
     """
     clean_base = re.sub(r"/pagina-\d+\.html$", "", base.rstrip("/"))
-    if page <= 1:
-        return clean_base + "/"
-    return f"{clean_base}/pagina-{page}.html"
+    return f"{clean_base}/pagina-{max(page, 1)}.html"
 
 
 def robots_ok(url):
@@ -307,7 +310,8 @@ def main():
     ap.add_argument("--start-page", type=int, default=1)
     ap.add_argument("--delay", type=float, nargs=2, default=(3.0, 6.0), metavar=("MIN", "MAX"),
                     help="pauza aleatorie intre cereri, secunde (default 3 6)")
-    ap.add_argument("--db", default="cars.db")
+    ap.add_argument("--db", default=str(DEFAULT_DB),
+                    help=f"fisierul SQLite (default: {DEFAULT_DB.relative_to(REPO_ROOT)})")
     ap.add_argument("--jsonl", help="optional: scrie si un fisier JSONL cu anunturile")
     ap.add_argument("--save-raw", action="store_true", help="salveaza HTML-ul brut in data/raw/")
     ap.add_argument("--html-file", help="parseaza un singur fisier HTML salvat local")
@@ -364,6 +368,7 @@ def main():
     s = requests.Session()
     s.headers.update(HEADERS)
     seen_total = 0
+    seen_ids = set()
 
     for page in range(args.start_page, args.start_page + args.max_pages):
         url = page_url(args.url, page)
@@ -382,11 +387,19 @@ def main():
             p.parent.mkdir(parents=True, exist_ok=True)
             p.write_text(html, encoding="utf-8")
 
+        # Dupa ultima pagina, auto.ro nu da 404 si nici pagina goala: intoarce din nou
+        # ultima pagina. Daca pagina nu aduce niciun anunt nou, am ajuns la final.
+        page_ids = {r["listing_id"] for r in parse_page(html)[0]}
+        if page_ids and page_ids <= seen_ids:
+            print(f"pagina {page}: aceleasi anunturi ca pagina anterioara -> am ajuns la ultima pagina.")
+            break
+
         rem = (args.max_cars - seen_total) if args.max_cars else None
         rows, _ = handle(html, page, url, rem)
         if not rows:
             print(f"pagina {page}: niciun anunt gasit, ma opresc.")
             break
+        seen_ids |= page_ids
 
         seen_total += len(rows)
         print(f"pagina {page}: {len(rows)} anunturi salvate (total adunate: {seen_total})")
